@@ -53,8 +53,15 @@ impl PackageFetcher {
     }
 
     /// Fetches a single package, and returns the [`PathBuf`] to the root of it.
-    pub fn fetch(&mut self, package: Package, yanked_whitelist: Option<HashSet<Package>>) -> Result<PathBuf, String> {
-        let _lock = self.config.acquire_package_cache_lock().map_err(|e| e.to_string())?;
+    pub fn fetch(
+        &mut self,
+        package: Package,
+        yanked_whitelist: Option<HashSet<Package>>,
+    ) -> Result<PathBuf, String> {
+        let _lock = self
+            .config
+            .acquire_package_cache_lock()
+            .map_err(|e| e.to_string())?;
         let mut map = SourceMap::new();
 
         let whitelist: HashSet<PackageId>;
@@ -75,7 +82,8 @@ impl PackageFetcher {
 
         map.insert(source);
 
-        let package_set = PackageSet::new(&[package.package_id], map, &self.config).map_err(|e| e.to_string())?;
+        let package_set =
+            PackageSet::new(&[package.package_id], map, &self.config).map_err(|e| e.to_string())?;
         Ok(package_set
             .get_one(package.package_id)
             .map_err(|e| e.to_string())?
@@ -98,7 +106,10 @@ impl PackageFetcher {
         packages: &[Package],
         yanked_whitelist: Option<HashSet<Package>>,
     ) -> Result<Vec<PathBuf>, String> {
-        let _lock = self.config.acquire_package_cache_lock().map_err(|e| e.to_string())?;
+        let _lock = self
+            .config
+            .acquire_package_cache_lock()
+            .map_err(|e| e.to_string())?;
         let mut map = SourceMap::new();
 
         let whitelist: HashSet<PackageId>;
@@ -120,7 +131,8 @@ impl PackageFetcher {
         }
 
         let packages: Vec<PackageId> = packages.iter().map(|p| p.package_id).collect();
-        let package_set = PackageSet::new(&packages, map, &self.config).map_err(|e| e.to_string())?;
+        let package_set =
+            PackageSet::new(&packages, map, &self.config).map_err(|e| e.to_string())?;
         Ok(package_set
             .get_many(package_set.package_ids())
             .map_err(|e| e.to_string())?
@@ -161,7 +173,11 @@ pub struct Package {
 impl Package {
     /// Constructs a [`Package`], from package name, its [`semver::Version`], and source where to
     /// fetch it from (crates.io, git, ...).
-    pub fn new<S: AsRef<str>>(name: S, version: Version, source: &PackageSource) -> Result<Self, String> {
+    pub fn new<S: AsRef<str>>(
+        name: S,
+        version: Version,
+        source: &PackageSource,
+    ) -> Result<Self, String> {
         Ok(Package {
             package_id: PackageId::new(
                 name.as_ref(),
