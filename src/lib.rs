@@ -6,7 +6,7 @@ use cargo::{
     util::IntoUrl,
 };
 use semver::Version;
-use std::{collections::HashSet, io::Write, path::PathBuf, str::FromStr};
+use std::{collections::HashSet, io::Write, path::PathBuf, str::FromStr, task::Poll};
 use url::Url;
 
 /// Main API of this library.
@@ -52,16 +52,48 @@ impl PackageFetcher {
         Ok(new_self)
     }
 
-    /// Fetches a single package, and returns the [`PathBuf`] to the root of it.
-    pub fn fetch(
-        &mut self,
-        package: Package,
+    pub fn resolve_package<N: AsRef<str>, V: AsRef<str>>(
+        &self,
+        name: N,
+        version: V,
+        source: PackageSource,
         yanked_whitelist: Option<HashSet<Package>>,
-    ) -> Result<PathBuf, String> {
-        let _lock = self
-            .config
-            .acquire_package_cache_lock()
+    ) -> Result<Package, String> {
+        let _lock = self.config.acquire_package_cache_lock().map_err(|e| e.to_string())?;
+        let src = source.to_source_id().map_err(|e| e.to_string())?;
+
+        let whitelist: HashSet<PackageId>;
+
+        if let Some(wl) = yanked_whitelist {
+            whitelist = wl.iter().map(|p| p.package_id).collect();
+        } else {
+            whitelist = Default::default();
+        };
+
+        let mut src = src.load(&self.config, &whitelist).map_err(|e| e.to_string())?;
+
+        let dep = cargo::core::Dependency::parse(name.as_ref(), Some(version.as_ref()), src.source_id())
             .map_err(|e| e.to_string())?;
+
+        let mut pkg: Option<PackageId> = None;
+
+        src.block_until_ready().map_err(|e| e.to_string())?;
+        let Poll::Ready(res) = src.query(&dep, cargo::core::QueryKind::Exact, &mut |sum| {pkg = Some(sum.package_id())}) else {
+			return Err("cargo returned a `Poll::Pending` after `block_until_ready`".into());
+		};
+
+        res.map_err(|e| e.to_string())?;
+
+        if let Some(pkg) = pkg {
+            Ok(Package { package_id: pkg })
+        } else {
+            Err("cargo wasn't able to find the requested package".into())
+        }
+    }
+
+    /// Fetches a single package, and returns the [`PathBuf`] to the root of it.
+    pub fn fetch(&mut self, package: Package, yanked_whitelist: Option<HashSet<Package>>) -> Result<PathBuf, String> {
+        let _lock = self.config.acquire_package_cache_lock().map_err(|e| e.to_string())?;
         let mut map = SourceMap::new();
 
         let whitelist: HashSet<PackageId>;
@@ -82,8 +114,7 @@ impl PackageFetcher {
 
         map.insert(source);
 
-        let package_set =
-            PackageSet::new(&[package.package_id], map, &self.config).map_err(|e| e.to_string())?;
+        let package_set = PackageSet::new(&[package.package_id], map, &self.config).map_err(|e| e.to_string())?;
         Ok(package_set
             .get_one(package.package_id)
             .map_err(|e| e.to_string())?
@@ -106,10 +137,7 @@ impl PackageFetcher {
         packages: &[Package],
         yanked_whitelist: Option<HashSet<Package>>,
     ) -> Result<Vec<PathBuf>, String> {
-        let _lock = self
-            .config
-            .acquire_package_cache_lock()
-            .map_err(|e| e.to_string())?;
+        let _lock = self.config.acquire_package_cache_lock().map_err(|e| e.to_string())?;
         let mut map = SourceMap::new();
 
         let whitelist: HashSet<PackageId>;
@@ -131,8 +159,7 @@ impl PackageFetcher {
         }
 
         let packages: Vec<PackageId> = packages.iter().map(|p| p.package_id).collect();
-        let package_set =
-            PackageSet::new(&packages, map, &self.config).map_err(|e| e.to_string())?;
+        let package_set = PackageSet::new(&packages, map, &self.config).map_err(|e| e.to_string())?;
         Ok(package_set
             .get_many(package_set.package_ids())
             .map_err(|e| e.to_string())?
@@ -163,8 +190,7 @@ impl From<Verbosity> for cargo::core::Verbosity {
 
 /// Package definition to be fetched by cargo.
 ///
-/// Note that this struct is not an actual package,
-/// it only contains the information needed for cargo to fetch the actual package.
+/// This type is cheap to copy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Package {
     package_id: PackageId,
@@ -173,11 +199,7 @@ pub struct Package {
 impl Package {
     /// Constructs a [`Package`], from package name, its [`semver::Version`], and source where to
     /// fetch it from (crates.io, git, ...).
-    pub fn new<S: AsRef<str>>(
-        name: S,
-        version: Version,
-        source: &PackageSource,
-    ) -> Result<Self, String> {
+    pub fn new<S: AsRef<str>>(name: S, version: Version, source: &PackageSource) -> Result<Self, String> {
         Ok(Package {
             package_id: PackageId::new(
                 name.as_ref(),
