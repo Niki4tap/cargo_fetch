@@ -13,15 +13,15 @@ use url::Url;
 ///
 /// Contains cargo config to drive package fetching.
 ///
-/// You can construct default instance of this struct by using [`PackageFetcher::default`],
-/// note however, that this function is *not* from [`Default`] trait, and can return an error.
+/// You can construct default instance of this struct by using [`PackageFetcher::new`].
 ///
 /// With default [`PackageFetcher`], cargo will try to output status and errors to the `stdout` and `stderr` of
 /// current process. If that is not desirable, you can construct it with
 /// [`PackageFetcher::with_out`], to intercept cargo `write` calls.
 ///
-/// After constructing, you can use [`PackageFetcher::fetch`], or [`PackageFetcher::fetch_many`]
-/// methods to fetch packages, see them for more documentation.
+/// After constructing, you can:
+/// * Resolve package versions with [`PackageFetcher::resolve_package`] and [`PackageFetcher::resolve_first`]
+/// * Fetch packages with [`PackageFetcher::fetch`], or [`PackageFetcher::fetch_many`]
 #[derive(Debug)]
 pub struct PackageFetcher {
     config: cargo::Config,
@@ -32,8 +32,7 @@ impl PackageFetcher {
     ///
     /// Cargo will output its colored status to the `stdout` and `stderr` of the current process by default, if that is not desirable, see
     /// [`PackageFetcher::with_out`].
-    #[allow(clippy::should_implement_trait)]
-    pub fn default() -> Result<Self, String> {
+    pub fn new() -> Result<Self, String> {
         Ok(Self {
             config: cargo::Config::default().map_err(|e| e.to_string())?,
         })
@@ -45,18 +44,62 @@ impl PackageFetcher {
     pub fn with_out(out: Box<dyn Write>, verbosity: Option<Verbosity>) -> Result<Self, String> {
         let mut shell = cargo::core::Shell::from_write(out);
         shell.set_verbosity(verbosity.unwrap_or_default().into());
-        let new_self = Self::default()?;
-        let mut sh = new_self.config.shell();
-        *sh = shell;
-        drop(sh);
+        let new_self = Self::new()?;
+        {
+            let mut sh = new_self.config.shell();
+            *sh = shell;
+        }
         Ok(new_self)
     }
 
-    pub fn resolve_package<N: AsRef<str>, V: AsRef<str>>(
+    /// Resolves all available package versions, given a version requirement and a name of the package.
+    ///
+    /// [`None`] in the `version` parameter means any version, or "*" semver requirement.
+    ///
+    /// `yanked_whitelist` field allows explicitly whitelist specific yanked versions.
+    pub fn resolve_package<N: AsRef<str>>(
         &self,
         name: N,
-        version: V,
-        source: PackageSource,
+        version: Option<&str>,
+        source: &PackageSource,
+        yanked_whitelist: Option<HashSet<Package>>,
+    ) -> Result<Vec<Package>, String> {
+        let _lock = self.config.acquire_package_cache_lock().map_err(|e| e.to_string())?;
+        let src = source.to_source_id().map_err(|e| e.to_string())?;
+
+        let whitelist: HashSet<PackageId>;
+
+        if let Some(wl) = yanked_whitelist {
+            whitelist = wl.iter().map(|p| p.package_id).collect();
+        } else {
+            whitelist = Default::default();
+        };
+
+        let mut src = src.load(&self.config, &whitelist).map_err(|e| e.to_string())?;
+
+        let dep = cargo::core::Dependency::parse(name.as_ref(), version, src.source_id())
+            .map_err(|e| e.to_string())?;
+
+        let mut pkgs = vec![];
+
+        src.block_until_ready().map_err(|e| e.to_string())?;
+        let Poll::Ready(res) = src.query(&dep, cargo::core::QueryKind::Exact, &mut |sum| {pkgs.push(Package {package_id: sum.package_id()})}) else {
+			return Err("cargo returned a `Poll::Pending` after `block_until_ready`".into());
+		};
+
+        res.map_err(|e| e.to_string())?;
+
+        Ok(pkgs)
+    }
+
+    /// Resolves first available package version, given a version requirement and a name of the package.
+    ///
+    /// For more information see: [`Self::resolve_package`].
+    pub fn resolve_first<N: AsRef<str>>(
+        &self,
+        name: N,
+        version: Option<&str>,
+        source: &PackageSource,
         yanked_whitelist: Option<HashSet<Package>>,
     ) -> Result<Package, String> {
         let _lock = self.config.acquire_package_cache_lock().map_err(|e| e.to_string())?;
@@ -72,7 +115,7 @@ impl PackageFetcher {
 
         let mut src = src.load(&self.config, &whitelist).map_err(|e| e.to_string())?;
 
-        let dep = cargo::core::Dependency::parse(name.as_ref(), Some(version.as_ref()), src.source_id())
+        let dep = cargo::core::Dependency::parse(name.as_ref(), version, src.source_id())
             .map_err(|e| e.to_string())?;
 
         let mut pkg: Option<PackageId> = None;
@@ -92,17 +135,11 @@ impl PackageFetcher {
     }
 
     /// Fetches a single package, and returns the [`PathBuf`] to the root of it.
-    pub fn fetch(&mut self, package: Package, yanked_whitelist: Option<HashSet<Package>>) -> Result<PathBuf, String> {
+    pub fn fetch(&mut self, package: Package) -> Result<PathBuf, String> {
         let _lock = self.config.acquire_package_cache_lock().map_err(|e| e.to_string())?;
         let mut map = SourceMap::new();
 
-        let whitelist: HashSet<PackageId>;
-
-        if let Some(wl) = yanked_whitelist {
-            whitelist = wl.iter().map(|p| p.package_id).collect();
-        } else {
-            whitelist = Default::default();
-        };
+        let whitelist: HashSet<PackageId> = std::iter::once(package.package_id).collect();
 
         let mut source = package
             .package_id
@@ -135,18 +172,11 @@ impl PackageFetcher {
     pub fn fetch_many(
         &mut self,
         packages: &[Package],
-        yanked_whitelist: Option<HashSet<Package>>,
     ) -> Result<Vec<PathBuf>, String> {
         let _lock = self.config.acquire_package_cache_lock().map_err(|e| e.to_string())?;
         let mut map = SourceMap::new();
 
-        let whitelist: HashSet<PackageId>;
-
-        if let Some(wl) = yanked_whitelist {
-            whitelist = wl.iter().map(|p| p.package_id).collect();
-        } else {
-            whitelist = Default::default();
-        };
+        let whitelist: HashSet<PackageId> = packages.iter().map(|p| p.package_id).collect();
 
         for package in packages {
             let mut source = package
@@ -155,7 +185,7 @@ impl PackageFetcher {
                 .load(&self.config, &whitelist)
                 .map_err(|e| e.to_string())?;
             source.block_until_ready().map_err(|e| e.to_string())?;
-            map.insert(source)
+            map.insert(source);
         }
 
         let packages: Vec<PackageId> = packages.iter().map(|p| p.package_id).collect();
@@ -189,6 +219,10 @@ impl From<Verbosity> for cargo::core::Verbosity {
 }
 
 /// Package definition to be fetched by cargo.
+///
+/// This type can either be construct from associated functions, if you have concrete versions of a package.
+/// Or by using [`PackageFetcher::resolve_package`] and [`PackageFetcher::resolve_first`] functions on [`PackageFetcher`]
+/// struct if you need to resolve a package from name and a version requirement, without requiring a specific version.
 ///
 /// This type is cheap to copy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -284,14 +318,18 @@ pub enum PackageSource {
 
 impl PackageSource {
     /// Constructs a new [`PackageSource::Path`] from path.
-    pub fn path<P: Into<PathBuf>>(path: P) -> Self {
-        Self::Path(path.into())
+    pub fn path<P: Into<PathBuf>>(path: P) -> Result<Self, String> {
+		let mut p = path.into();
+		if !p.is_absolute() {
+			p = p.canonicalize().map_err(|e| e.to_string())?;
+		}
+		Ok(Self::Path(p))
     }
 
     /// Constructs a new [`PackageSource::Git`] from repository url and an optional [`GitReference`], if [`None`] is provided, [`GitReference::DefaultBranch`] will be assumed.
-    pub fn git<U: TryInto<Url>>(url: U, git_ref: Option<GitReference>) -> Result<Self, U::Error> {
+    pub fn git<U: AsRef<str>>(url: U, git_ref: Option<GitReference>) -> Result<Self, <Url as FromStr>::Err> {
         Ok(Self::Git {
-            url: url.try_into()?,
+            url: Url::from_str(url.as_ref())?,
             git_ref: git_ref.unwrap_or(GitReference::DefaultBranch),
         })
     }
